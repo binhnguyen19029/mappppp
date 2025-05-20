@@ -1,63 +1,59 @@
-name: Process OSM CSV Chunk
-
-on:
-  workflow_dispatch:
-    inputs:
-      part:
-        description: 'Chunk number to process (01–63)'
-        required: true
-        default: '01'
-
+name: Deploy and Expose API with Cloudflare Tunnel
+'on':
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch: null
 jobs:
-  process:
+  deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Build Docker image
+        uses: docker/build-push-action@v4
         with:
-          python-version: '3.10'
-
-      - name: Install dependencies
+          context: .
+          push: false
+          load: true
+          tags: 'api-app:latest'
+      - name: Start the API container with Cloudflare Tunnel
+        run: >
+          docker run -d -p 8080:8080 --name api-container api-app:latest
+          sleep 30
+          echo "Container logs:"
+          docker logs api-container
+          TUNNEL_URL=$(docker logs api-container 2>&1 | grep -o
+          'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' | tail -1)
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "::notice::Your application is available at: $TUNNEL_URL"
+          else
+            echo "::warning::Could not extract Cloudflare tunnel URL from logs"
+          fi
+      - name: Keep container running for monitoring (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
         run: |
-          pip install --upgrade pip
-          pip install osmium shapely rtree psycopg2-binary geopy
-
-      - name: Cache Vietnam OSM PBF
-        id: cache-pbf
-        uses: actions/cache@v3
-        with:
-          path: vietnam-latest.osm.pbf
-          key: osm-pbf-${{ runner.os }}-v1
-          restore-keys: |
-            osm-pbf-${{ runner.os }}-
-
-      - name: Download PBF if missing
-        if: steps.cache-pbf.outputs.cache-hit != 'true'
+          echo "Container will remain active for 1 hour for monitoring."
+          sleep 3600
+      - name: Wait 5 hours before triggering next build
         run: |
-          curl -SL -o vietnam-latest.osm.pbf https://download.geofabrik.de/asia/vietnam-latest.osm.pbf
-
-      - name: Process chunk ${{ github.event.inputs.part }}
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          INPUT="vietnam_part_${{ github.event.inputs.part }}.csv"
-          python process_osm.py \
-            --osm-pbf vietnam-latest.osm.pbf \
-            --input-csv "csv_chunks/$INPUT" \
-            --db-url "$DATABASE_URL"
-
+          echo "Sleeping for 5 hours before re-dispatching workflow..."
+          sleep 18000
   trigger_next:
-    needs: process
+    needs: deploy
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.part != '63' && success() }}
     steps:
       - name: Trigger next chunk
         uses: actions/github-script@v6
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: '${{ secrets.GITHUB_TOKEN }}'
           script: |
             const next = String(parseInt(inputs.part) + 1).padStart(2, '0');
             await github.rest.actions.createWorkflowDispatch({
